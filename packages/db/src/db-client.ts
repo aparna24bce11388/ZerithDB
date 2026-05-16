@@ -171,23 +171,23 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
    * Count documents matching a filter.
    */
   async count(filter: QueryFilter<T> = {}): Promise<number> {
-  try {
-    if (Object.keys(filter).length === 0) {
-      // fast path: no filter
-      return await this.table.count();
-    }
+    try {
+      if (Object.keys(filter).length === 0) {
+        // fast path: no filter
+        return await this.table.count();
+      }
 
-    // fallback: filtered count
-    const all = await this.table.toArray();
-    return all.filter((doc) => this.matchesFilter(doc, filter)).length;
-  } catch (err) {
-    throw new ZerithDBError(
-      ErrorCode.DB_READ_FAILED,
-      `Failed to count documents in "${this.collectionName}"`,
-      { cause: err }
-    );
+      // fallback: filtered count
+      const all = await this.table.toArray();
+      return all.filter((doc) => this.matchesFilter(doc, filter)).length;
+    } catch (err) {
+      throw new ZerithDBError(
+        ErrorCode.DB_READ_FAILED,
+        `Failed to count documents in "${this.collectionName}"`,
+        { cause: err }
+      );
+    }
   }
-}
   private matchesFilter(doc: Document<T>, filter: QueryFilter<T>): boolean {
     for (const [key, condition] of Object.entries(filter)) {
       const fieldValue = (doc as Record<string, any>)[key];
