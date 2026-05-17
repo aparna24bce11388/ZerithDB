@@ -25,6 +25,27 @@ jobs:
 
             // Check if comment starts with /assign or /unassign
             if (comment.startsWith('/assign')) {
+              const assignees = context.payload.issue.assignees.map(a => a.login);
+              
+              if (assignees.length > 0) {
+                if (assignees.includes(user)) {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number,
+                    body: `👋 Hi @${user}, you are already assigned to this issue!`
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner,
+                    repo,
+                    issue_number,
+                    body: `⚠️ **Already Assigned**\n\nSorry @${user}, this issue is already assigned to @${assignees.join(', @')}. Please find another unassigned issue to contribute to! 🚀`
+                  });
+                }
+                return;
+              }
+
               console.log(`Assigning @${user} to issue #${issue_number}`);
               try {
                 await github.rest.issues.addAssignees({
