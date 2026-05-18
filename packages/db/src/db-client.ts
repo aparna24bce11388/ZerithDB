@@ -1,25 +1,29 @@
-import Dexie, { type Table } from "dexie";
+import { Dexie, type Table, liveQuery } from "dexie";
 import { v7 as uuidv7 } from "uuid";
 
 import type {
   ZerithDBConfig,
   Document,
   QueryFilter,
+  QueryOptions,
   InsertResult,
   UpdateSpec,
+  ValidatorRegistry,
 } from "zerithdb-core";
 
 import { ZerithDBError, ErrorCode } from "zerithdb-core";
 import { wrapIDBOperation } from "./internal/wrap-idb-operation.js";
+import { EventEmitter } from "zerithdb-core";
 import type { BackupExportOptions, BackupSnapshot } from "./backup.js";
 
 export class CollectionClient<T extends Record<string, any> = Record<string, any>> {
   constructor(
-    private readonly table: Table<Document<T>>,
+    private readonly dbClient: DbClient,
     private readonly collectionName: string
   ) {}
 
   async insert(document: T): Promise<InsertResult> {
+    const table = await this.getTable();
     const now = Date.now();
     const id = uuidv7();
 
@@ -34,13 +38,14 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       ErrorCode.DB_WRITE_FAILED,
       `Failed to insert into collection "${this.collectionName}"`,
       async () => {
-        await this.table.add(doc);
+        await table.add(doc);
         return { id };
       }
     );
   }
 
   async insertMany(documents: T[]): Promise<InsertResult[]> {
+    const table = await this.getTable();
     const now = Date.now();
 
     const docs = documents.map((doc) => ({
@@ -54,61 +59,66 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
       ErrorCode.DB_WRITE_FAILED,
       `Failed to bulk insert into collection "${this.collectionName}"`,
       async () => {
-        await this.table.bulkAdd(docs);
+        await table.bulkAdd(docs);
         return docs.map((d) => ({ id: d._id }));
       }
     );
   }
 
   async find(filter: QueryFilter<T> = {}): Promise<Document<T>[]> {
+    const table = await this.getTable();
     return wrapIDBOperation(
       ErrorCode.DB_READ_FAILED,
       `Failed to query collection "${this.collectionName}"`,
       async () => {
-        const all = await this.table.toArray();
+        const all = await table.toArray();
         return all.filter((doc) => this.matchesFilter(doc, filter));
       }
     );
   }
 
   async findById(id: string): Promise<Document<T> | undefined> {
+    const table = await this.getTable();
     return wrapIDBOperation(
       ErrorCode.DB_READ_FAILED,
       `Failed to get document "${id}" from "${this.collectionName}"`,
-      () => this.table.get(id)
+      () => table.get(id)
     );
   }
 
   async update(filter: QueryFilter<T>, spec: UpdateSpec<T>): Promise<number> {
+    const table = await this.getTable();
     return wrapIDBOperation(
       ErrorCode.DB_WRITE_FAILED,
       `Failed to update documents in "${this.collectionName}"`,
       async () => {
         const matches = await this.find(filter);
         const now = Date.now();
-        await this.table.bulkPut(matches.map((doc) => this.applyUpdateSpec(doc, spec, now)));
+        await table.bulkPut(matches.map((doc) => this.applyUpdateSpec(doc, spec, now)));
         return matches.length;
       }
     );
   }
 
   async delete(filter: QueryFilter<T>): Promise<number> {
+    const table = await this.getTable();
     return wrapIDBOperation(
       ErrorCode.DB_DELETE_FAILED,
       `Failed to delete documents from "${this.collectionName}"`,
       async () => {
         const matches = await this.find(filter);
-        await this.table.bulkDelete(matches.map((d) => d._id));
+        await table.bulkDelete(matches.map((d) => d._id));
         return matches.length;
       }
     );
   }
 
   async clearAll(): Promise<void> {
+    const table = await this.getTable();
     return wrapIDBOperation(
       ErrorCode.DB_DELETE_FAILED,
       `Failed to clear collection "${this.collectionName}"`,
-      () => this.table.clear()
+      () => table.clear()
     );
   }
 
@@ -196,6 +206,7 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
 class ZerithDBDexie extends Dexie {
   private readonly tableMap = new Map<string, Table>();
   private _currentSchema: Record<string, string> = {};
+  private _initPromise: Promise<void> | null = null;
   private _pendingVersion = 0;
 
   constructor(appId: string) {
@@ -207,25 +218,43 @@ class ZerithDBDexie extends Dexie {
    * upgrade if it has not been registered yet.
    *
    * @param name - The collection name to create or retrieve
-   * @returns The Dexie {@link Table} handle for the collection
+   * @returns A promise that resolves to the Dexie {@link Table} handle for the collection
    */
-  ensureCollection(name: string): Table {
-    if (!this.tableMap.has(name)) {
-      this._currentSchema[name] = "_id, _createdAt, _updatedAt";
-      
-      // We must increment the version for every new collection added dynamically
-      const nextVersion = Math.max(this.verno, this._pendingVersion) + 1;
-      this._pendingVersion = nextVersion;
-
-      if (this.isOpen()) {
-        this.close();
-      }
-
-      this.version(nextVersion).stores(this._currentSchema);
-      this.tableMap.set(name, this.table(name));
+  async ensureCollectionAsync(name: string): Promise<Table> {
+    if (this.tableMap.has(name)) {
+      return this.tableMap.get(name)!;
     }
 
     return this.tableMap.get(name)!;
+  }
+
+  private async _performSchemaUpgrade(name: string): Promise<void> {
+    this._currentSchema[name] = "_id, _createdAt, _updatedAt";
+
+    // Obtain the actual database version from IndexedDB
+    let actualVersion = this.verno;
+    if (!this.isOpen()) {
+      try {
+        await this.open();
+        actualVersion = this.verno;
+      } catch (e) {
+        // If the DB doesn't exist yet, open() will succeed and set verno to 1
+        actualVersion = this.verno || 0;
+      }
+    }
+
+    // Determine the next version, ensuring it strictly increases
+    const nextVersion = Math.max(actualVersion, this._pendingVersion) + 1;
+    this._pendingVersion = nextVersion;
+
+    if (this.isOpen()) {
+      this.close();
+    }
+
+    this.version(nextVersion).stores(this._currentSchema);
+    this.tableMap.set(name, this.table(name));
+
+    await this.open();
   }
 }
 
@@ -237,9 +266,11 @@ export class DbClient {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly collections = new Map<string, CollectionClient<any>>();
 
-  constructor(config: ZerithDBConfig) {
-    this.appId = config.appId;
-    this.dexie = new ZerithDBDexie(config.appId);
+  /**
+   * Internal Dexie table accessor
+   */
+  private get table(): Table<Document<T>> {
+    return this.dexie.table(this.collectionName);
   }
 
   collection<T extends Record<string, any>>(name: string): CollectionClient<T> {
@@ -254,12 +285,22 @@ export class DbClient {
     return this.collections.get(name)!;
   }
 
+  async getTable<T extends Record<string, any>>(name: string): Promise<Table<Document<T>>> {
+    return (await this.dexie.ensureCollectionAsync(name)) as Table<Document<T>>;
+  }
+
+  /**
+   * Returns per-collection document counts for DevTools memory reporting.
+   */
   async getMemoryStats(): Promise<{ recordCount: number; collections: Record<string, number> }> {
     const collections: Record<string, number> = {};
     let recordCount = 0;
 
-    for (const [name, client] of this.collections) {
+    for (const [key, client] of this.collections) {
+      // Strip the ":uuid" / ":autoincrement" suffix for the stat label
+      const name = key.split(":")[0]!;
       const count = await client.count();
+
       collections[name] = count;
       recordCount += count;
     }
@@ -267,34 +308,43 @@ export class DbClient {
     return { recordCount, collections };
   }
 
-  /**
-   * Returns names of collections that have been opened in this session.
-   */
   collectionNames(): string[] {
-    return Array.from(this.collections.keys());
+    // Deduplicate in case same collection opened with different strategies
+    return [...new Set(Array.from(this.collections.keys()).map((k) => k.split(":")[0]!))];
   }
 
-  /**
-   * Returns names of all collections currently stored in IndexedDB.
-   */
   allCollectionNames(): string[] {
-    return this.dexie.tables.map((t) => t.name);
+    return this.dexie.tables.map((t) => t.name).filter((name) => !name.startsWith("_"));
   }
 
-  /**
-   * Export all collections to a JSON-serializable snapshot.
-   * If options.collections is omitted, it exports ALL collections found in IndexedDB.
-   */
-  async exportSnapshot(options: BackupExportOptions = {}): Promise<BackupSnapshot> {
+  async exportSnapshot(
+    options: BackupExportOptions = {}
+  ): Promise<BackupSnapshot> {
+    if (this.auth?.biometric?.isBiometricRequiredForDB()) {
+      const authorized =
+        await this.auth.biometric.promptBiometric(
+          "Authorize sensitive operation: Export full database backup snapshot"
+        );
+
+      if (!authorized) {
+        throw new ZerithDBError(
+          ErrorCode.AUTH_SIGN_FAILED,
+          "Database export cancelled or biometric authentication failed."
+        );
+      }
+    }
+
     return wrapIDBOperation(
       ErrorCode.DB_READ_FAILED,
       "Failed to export local backup snapshot",
       async () => {
-        const collectionNames = options.collections ?? this.allCollectionNames();
+        const collectionNames =
+          options.collections ?? this.allCollectionNames();
+
         const collections: BackupSnapshot["collections"] = {};
 
         for (const name of collectionNames) {
-          const table = this.dexie.ensureCollection(name);
+          const table = await this.dexie.ensureCollectionAsync(name);
           collections[name] = (await table.toArray()) as Document<Record<string, any>>[];
         }
 
@@ -307,7 +357,11 @@ export class DbClient {
       }
     );
   }
+
   async dispose(): Promise<void> {
+    // Remove all EventEmitter listeners before closing to prevent memory leaks
+    // from dangling references to this DbClient instance after disposal.
+    this.removeAllListeners();
     this.dexie.close();
   }
 }
